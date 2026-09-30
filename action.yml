@@ -1,5 +1,5 @@
 name: 'Assert iOS Signing'
-description: 'Prove a provisioning profile and certificate can sign your bundle ID — in seconds, on Linux, before a macOS build tries and fails.'
+description: 'Instantly validate your iOS signing capability before building on costly macOS runners'
 author: 'Matt Goldman'
 
 branding:
