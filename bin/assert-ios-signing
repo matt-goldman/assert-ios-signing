@@ -1,0 +1,734 @@
+#!/usr/bin/env bash
+#
+# assert-ios-signing — prove an iOS provisioning profile and signing certificate
+# can actually sign a given bundle ID, before a build tries and fails.
+#
+# Runs on Linux and macOS. All certificate and private key material is handled in
+# memory: nothing is written to disk, and no keychain is created or modified.
+#
+# See --help for usage.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
+
+# Apple-exported .p12 files often use legacy PKCS#12 ciphers. OpenSSL 3 needs
+# -legacy for those; LibreSSL (macOS) rejects the flag but reads them anyway.
+# Support is probed once, below.
+OPENSSL="${OPENSSL:-openssl}"
+command -v "$OPENSSL" >/dev/null 2>&1 || { echo "assert-ios-signing: openssl not found (set \$OPENSSL)" >&2; exit 2; }
+
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+    done
+fi
+[[ -n "$PYTHON" ]] || { echo "assert-ios-signing: python3 not found (set \$PYTHON)" >&2; exit 2; }
+
+P12_LEGACY=""
+if "$OPENSSL" pkcs12 -help 2>&1 | grep -q -- '-legacy'; then
+    P12_LEGACY="-legacy"
+fi
+
+IS_MACOS=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_MACOS=true
+
+# Colour, unless disabled or piped somewhere that will not render it.
+if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 && -z "${GITHUB_ACTIONS:-}" && -z "${FORCE_COLOR:-}" ]]; then
+    RED=""; GREEN=""; YELLOW=""; DIM=""; BOLD=""; NC=""
+else
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    DIM=$'\033[2m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+fi
+
+# -----------------------------------------------------------------------------
+# Arguments
+# -----------------------------------------------------------------------------
+
+PROFILE_PATH=""
+PROFILE_CONTENT="${IOS_PROFILE_BASE64:-}"
+CERT_PATH=""
+CERT_CONTENT="${IOS_CERT_BASE64:-}"
+CERT_NAME=""
+CERT_PASSWORD="${IOS_CERT_PASSWORD:-}"
+WANT_BUNDLE_ID=""
+WANT_PROFILE_TYPE=""
+WANT_TEAM_ID=""
+
+usage() {
+    cat <<USAGE
+assert-ios-signing $VERSION — verify iOS signing inputs before a build uses them.
+
+Usage:
+  assert-ios-signing --profile <file> [--cert <file>] [options]
+
+Required:
+  --profile <file>       .mobileprovision, a bare plist, or either base64-encoded.
+
+Certificate (one of):
+  --cert <file>          PEM (certificate + private key) or PKCS#12, raw or base64.
+  --cert-name <name>     Look the identity up in the macOS keychains instead.
+                         Only works on macOS. Ignored if --cert is given, except
+                         as an extra assertion on the certificate's common name.
+
+Assertions (each optional; all that are given must hold):
+  --bundle-id <id>       The app's bundle identifier, e.g. com.example.app.
+                         Checked against the profile's application-identifier,
+                         honouring wildcard profiles.
+  --profile-type <type>  One of: development, adhoc, appstore, enterprise.
+  --team-id <id>         Expected Apple Developer team identifier.
+
+Other:
+  --cert-password <pw>   Prefer \$IOS_CERT_PASSWORD, which keeps the password out
+                         of the process table and your shell history.
+  --no-summary           Do not write a GitHub Actions job summary.
+  -h, --help             This text.
+  --version              Print the version.
+
+Environment:
+  IOS_CERT_PASSWORD      Certificate password.
+  OPENSSL / PYTHON       Override the binaries used.
+  NO_COLOR               Disable colour.
+
+Exit codes:
+  0  every check passed
+  1  a check failed
+  2  the inputs could not be read at all
+
+Legacy positional form, still supported:
+  assert-ios-signing <profile> <cert_name> [cert_file] [cert_password]
+USAGE
+}
+
+WRITE_SUMMARY=true
+POSITIONAL=()
+
+while (( $# )); do
+    case "$1" in
+        --profile)        PROFILE_PATH="${2:-}"; shift 2 ;;
+        --cert)           CERT_PATH="${2:-}"; shift 2 ;;
+        --cert-base64)    CERT_CONTENT="${2:-}"; shift 2 ;;
+        --profile-base64) PROFILE_CONTENT="${2:-}"; shift 2 ;;
+        --cert-name)      CERT_NAME="${2:-}"; shift 2 ;;
+        --cert-password)  CERT_PASSWORD="${2:-}"; shift 2 ;;
+        --bundle-id)      WANT_BUNDLE_ID="${2:-}"; shift 2 ;;
+        --profile-type)   WANT_PROFILE_TYPE="${2:-}"; shift 2 ;;
+        --team-id)        WANT_TEAM_ID="${2:-}"; shift 2 ;;
+        --no-summary)     WRITE_SUMMARY=false; shift ;;
+        --profilebase64|--certbase64) shift ;;   # auto-detected now; accepted as a no-op
+        -h|--help)        usage; exit 0 ;;
+        --version)        echo "$VERSION"; exit 0 ;;
+        -*)               echo "assert-ios-signing: unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)                POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+# Legacy positional form: <profile> <cert_name> [cert_file] [cert_password]
+if (( ${#POSITIONAL[@]} )); then
+    [[ -z "$PROFILE_PATH"   ]] && PROFILE_PATH="${POSITIONAL[0]:-}"
+    [[ -z "$CERT_NAME"      ]] && CERT_NAME="${POSITIONAL[1]:-}"
+    [[ -z "$CERT_PATH"      ]] && CERT_PATH="${POSITIONAL[2]:-}"
+    [[ -z "$CERT_PASSWORD"  ]] && CERT_PASSWORD="${POSITIONAL[3]:-}"
+fi
+
+# -----------------------------------------------------------------------------
+# Reporting
+#
+# Failures are the product here: a mismatch has to say what the profile actually
+# authorises, so nobody has to go read a build log to find out.
+# -----------------------------------------------------------------------------
+
+FAILURES=0
+SUMMARY_ROWS=""
+STEP=0
+
+annotate() {  # annotate <error|warning|notice> <message>
+    [[ -n "${GITHUB_ACTIONS:-}" ]] || return 0
+    # Annotations must be one line; encode the newlines GitHub understands.
+    local msg="${2//$'\n'/%0A}"
+    printf '::%s title=assert-ios-signing::%s\n' "$1" "$msg"
+}
+
+step()  { STEP=$((STEP + 1)); printf '\n%s%d. %s%s\n' "$BOLD" "$STEP" "$1" "$NC"; }
+info()  { printf '   %s%s%s\n' "$DIM" "$1" "$NC"; }
+pass()  { printf '   %s[PASS]%s %s\n' "$GREEN" "$NC" "$1"; SUMMARY_ROWS+="| ✅ | ${1//|/\\|} |"$'\n'; }
+warn()  { printf '   %s[WARN]%s %s\n' "$YELLOW" "$NC" "$1"; SUMMARY_ROWS+="| ⚠️ | ${1//|/\\|} |"$'\n'; annotate warning "$1"; }
+
+# A failed check records itself and lets the run continue, so one invocation
+# reports every problem rather than only the first.
+fail() {
+    printf '   %s[FAIL]%s %s\n' "$RED" "$NC" "$1"
+    FAILURES=$((FAILURES + 1))
+    SUMMARY_ROWS+="| ❌ | ${1//|/\\|} |"$'\n'
+    annotate error "$1"
+}
+
+# Unreadable inputs are different: there is nothing left to check, so stop.
+abort() {
+    printf '%sassert-ios-signing: %s%s\n' "$RED" "$1" "$NC" >&2
+    annotate error "$1"
+    exit 2
+}
+
+emit_output() {  # emit_output <name> <value>
+    [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+    # Values come from certificate and profile fields, so strip newlines: one in
+    # a common name would otherwise inject further entries into the output file.
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr -d '\r\n')" >> "$GITHUB_OUTPUT"
+}
+
+# -----------------------------------------------------------------------------
+# In-memory input handling
+#
+# Binary inputs cannot survive a shell variable (NUL bytes are lost), so each is
+# held base64-encoded and decoded onto a pipe when needed. Nothing hits disk.
+# -----------------------------------------------------------------------------
+
+# Reading an input is done in Python: it peels any base64 wrapping, sniffs the
+# format, and hands back a single clean base64 line. Doing it here keeps binary
+# bytes out of shell variables entirely — bash drops NUL bytes from command
+# substitution, silently on bash 3.2 and with a warning on 5.2 — and avoids
+# depending on dd, od or xxd, which are not installed everywhere.
+PY_NORMALIZE='
+import sys, base64, re
+
+raw = sys.stdin.buffer.read()
+
+B64_TEXT = re.compile(rb"^[A-Za-z0-9+/\s]*={0,2}\s*$")
+
+def peel(data):
+    """Unwrap up to three layers of base64; some pipelines encode twice."""
+    for _ in range(3):
+        stripped = b"".join(data.split())
+        if not stripped or len(stripped) % 4 or not B64_TEXT.match(data):
+            return data
+        try:
+            inner = base64.b64decode(stripped, validate=True)
+        except Exception:
+            return data
+        if not inner:
+            return data
+        data = inner
+    return data
+
+raw = peel(raw)
+
+if raw.startswith(b"-----BEGIN"):
+    fmt = "pem"
+elif raw.startswith(b"<?xml") or raw.startswith(b"bplist"):
+    fmt = "plist"
+elif raw[:1] == b"\x30":
+    fmt = "der"      # PKCS#12 for a certificate, CMS for a provisioning profile
+else:
+    fmt = "unknown"
+
+sys.stdout.write(fmt + "\n")
+sys.stdout.write(base64.b64encode(raw).decode("ascii") + "\n")
+'
+
+# Decode a base64-held blob onto stdout. Bytes only ever exist on a pipe.
+emit() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+
+INPUT_FORMAT=""
+INPUT_HELD=""
+
+_take_input() {  # bytes on stdin — sets INPUT_FORMAT and INPUT_HELD
+    local out
+    out="$("$PYTHON" -c "$PY_NORMALIZE" 2>/dev/null)" || return 1
+    INPUT_FORMAT="${out%%$'\n'*}"
+    INPUT_HELD="${out#*$'\n'}"
+    INPUT_HELD="${INPUT_HELD//$'\n'/}"
+    [[ -n "$INPUT_HELD" ]]
+}
+
+# Both feed _take_input by redirection, never by a pipe: a pipe would run it in
+# a subshell and the variables it sets would not survive.
+read_input()         { _take_input < "$1"; }                    # read_input <path>
+read_input_content() { _take_input < <(printf '%s' "$1"); }     # read_input_content <content>
+
+normalise_sha1() {
+    LC_ALL=C sed 's/[^0-9A-Fa-f]//g' | tr '[:lower:]' '[:upper:]' | grep -E '^[0-9A-F]{40}$'
+}
+
+if [[ -z "$PROFILE_PATH" && -z "$PROFILE_CONTENT" ]]; then
+    usage >&2; exit 2
+fi
+if [[ -n "$PROFILE_PATH" && ! -f "$PROFILE_PATH" ]]; then
+    abort "provisioning profile not found: $PROFILE_PATH"
+fi
+if [[ -n "$CERT_PATH" && ! -f "$CERT_PATH" ]]; then
+    abort "certificate file not found: $CERT_PATH"
+fi
+
+HAVE_CERT=false
+[[ -n "$CERT_PATH" || -n "$CERT_CONTENT" ]] && HAVE_CERT=true
+
+if [[ "$HAVE_CERT" != true && -z "$CERT_NAME" ]]; then
+    abort "no certificate given: pass --cert <file>, set \$IOS_CERT_BASE64, or use --cert-name <name> on macOS"
+fi
+if [[ "$HAVE_CERT" != true && "$IS_MACOS" != true ]]; then
+    abort "--cert-name reads the macOS keychains and cannot work on $(uname -s); pass --cert <file> or set \$IOS_CERT_BASE64 instead"
+fi
+
+printf '%s=== assert-ios-signing %s ===%s\n' "$BOLD" "$VERSION" "$NC"
+info "certificate and key material is processed in memory only"
+
+# -----------------------------------------------------------------------------
+# Read the provisioning profile
+#
+# A .mobileprovision is a CMS/PKCS#7 container. Unwrapping it with openssl needs
+# no keychain, unlike `security cms -D`, which is macOS-only and mutates the
+# default keychain as a side effect of decoding.
+# -----------------------------------------------------------------------------
+
+if [[ -n "$PROFILE_PATH" ]]; then
+    read_input "$PROFILE_PATH" || abort "could not read provisioning profile: $PROFILE_PATH"
+    PROFILE_ORIGIN="$PROFILE_PATH"
+else
+    read_input_content "$PROFILE_CONTENT" || abort "could not read the profile from \$IOS_PROFILE_BASE64"
+    PROFILE_ORIGIN="\$IOS_PROFILE_BASE64"
+fi
+PROFILE_HELD="$INPUT_HELD"
+PROFILE_FORMAT="$INPUT_FORMAT"
+[[ "$PROFILE_FORMAT" != unknown ]] || abort "$PROFILE_ORIGIN is not a provisioning profile (expected a .mobileprovision, a plist, or either base64-encoded)"
+
+profile_plist() {
+    # A bare plist needs no unwrapping.
+    if [[ "$PROFILE_FORMAT" == plist ]]; then emit "$PROFILE_HELD"; return 0; fi
+    local out
+    # smime first, then cms: coverage differs between OpenSSL and LibreSSL.
+    for verb in smime cms; do
+        out="$(emit "$PROFILE_HELD" | "$OPENSSL" "$verb" -verify -noverify -inform DER 2>/dev/null)"
+        if [[ -n "$out" ]]; then printf '%s' "$out"; return 0; fi
+    done
+    # Last resort: lift the plist straight out of the container. Apple embeds it
+    # as XML, so this still works where neither openssl verb is available.
+    emit "$PROFILE_HELD" | LC_ALL=C sed -n '/<?xml/,/<\/plist>/p'
+}
+
+# One Python pass does all the plist work: parsing (XML and binary), the
+# expiration date, the profile type, and the SHA-1 of each embedded certificate.
+# A certificate fingerprint is just the SHA-1 of its DER bytes, so this needs no
+# X.509 parser and no openssl subprocess per certificate.
+PY_PROFILE='
+import sys, plistlib, hashlib, datetime
+
+raw = sys.stdin.buffer.read()
+if not raw.strip():
+    sys.stderr.write("empty profile payload\n"); sys.exit(1)
+try:
+    pl = plistlib.loads(raw)
+except Exception as exc:
+    sys.stderr.write("could not parse profile plist: %s\n" % exc); sys.exit(1)
+if not isinstance(pl, dict):
+    sys.stderr.write("profile plist is not a dictionary\n"); sys.exit(1)
+
+def put(key, value):
+    sys.stdout.write("%s=%s\n" % (key, str(value).replace("\n", " ").replace("\r", " ")))
+
+ents = pl.get("Entitlements") or {}
+if not isinstance(ents, dict):
+    ents = {}
+
+put("name", pl.get("Name", ""))
+put("uuid", pl.get("UUID", ""))
+put("appid", ents.get("application-identifier", ""))
+
+teams = pl.get("TeamIdentifier") or []
+put("team", teams[0] if teams else ents.get("com.apple.developer.team-identifier", ""))
+put("teamname", pl.get("TeamName", ""))
+
+prefixes = pl.get("ApplicationIdentifierPrefix") or []
+put("prefix", prefixes[0] if prefixes else "")
+
+exp = pl.get("ExpirationDate")
+if isinstance(exp, datetime.datetime):
+    # plistlib returns naive datetimes that represent UTC.
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=datetime.timezone.utc)
+    put("expires_epoch", int(exp.timestamp()))
+    put("expires_iso", exp.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+devices = pl.get("ProvisionedDevices")
+if pl.get("ProvisionsAllDevices"):
+    ptype = "enterprise"
+elif devices:
+    ptype = "development" if ents.get("get-task-allow") else "adhoc"
+else:
+    ptype = "appstore"
+put("type", ptype)
+put("devices", len(devices) if devices else 0)
+put("aps", ents.get("aps-environment", ""))
+
+certs = pl.get("DeveloperCertificates") or []
+put("cert_count", len(certs))
+for der in certs:
+    put("cert_sha1", hashlib.sha1(bytes(der)).hexdigest().upper())
+'
+
+MANIFEST="$(profile_plist | "$PYTHON" -c "$PY_PROFILE" 2>&1)"
+if (( $? != 0 )) || [[ -z "$MANIFEST" ]] || ! printf '%s' "$MANIFEST" | grep -q '^cert_count='; then
+    abort "could not decode provisioning profile: $PROFILE_ORIGIN${MANIFEST:+ ($MANIFEST)}"
+fi
+
+P_NAME=""; P_UUID=""; P_APPID=""; P_TEAM=""; P_TEAMNAME=""; P_PREFIX=""
+P_EXP_EPOCH=""; P_EXP_ISO=""; P_TYPE=""; P_DEVICES=""; P_APS=""
+P_CERT_COUNT=0; P_CERT_SHA1S=""
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        name)          P_NAME="$value" ;;
+        uuid)          P_UUID="$value" ;;
+        appid)         P_APPID="$value" ;;
+        team)          P_TEAM="$value" ;;
+        teamname)      P_TEAMNAME="$value" ;;
+        prefix)        P_PREFIX="$value" ;;
+        expires_epoch) P_EXP_EPOCH="$value" ;;
+        expires_iso)   P_EXP_ISO="$value" ;;
+        type)          P_TYPE="$value" ;;
+        devices)       P_DEVICES="$value" ;;
+        aps)           P_APS="$value" ;;
+        cert_count)    P_CERT_COUNT="$value" ;;
+        cert_sha1)     P_CERT_SHA1S+="$value"$'\n' ;;
+    esac
+done < <(printf '%s\n' "$MANIFEST")
+
+# The bundle ID the profile is for, with the team prefix stripped.
+P_BUNDLE_ID="$P_APPID"
+if [[ -n "$P_PREFIX" && "$P_APPID" == "$P_PREFIX."* ]]; then
+    P_BUNDLE_ID="${P_APPID#"$P_PREFIX".}"
+elif [[ "$P_APPID" == *.* ]]; then
+    P_BUNDLE_ID="${P_APPID#*.}"
+fi
+
+printf '\n%sProfile%s\n' "$BOLD" "$NC"
+info "name       ${P_NAME:-(unnamed)}"
+info "bundle ID  ${P_BUNDLE_ID:-(none)}"
+info "type       ${P_TYPE:-unknown}$([[ "${P_DEVICES:-0}" != 0 ]] && printf ' (%s provisioned device(s))' "$P_DEVICES")"
+info "team       ${P_TEAM:-(none)}${P_TEAMNAME:+ — $P_TEAMNAME}"
+[[ -n "$P_APS" ]] && info "push       $P_APS"
+info "certs      $P_CERT_COUNT embedded"
+[[ -n "$P_UUID" ]] && info "uuid       $P_UUID"
+
+emit_output profile-name "$P_NAME"
+emit_output profile-type "$P_TYPE"
+emit_output bundle-id    "$P_BUNDLE_ID"
+emit_output team-id      "$P_TEAM"
+emit_output profile-uuid "$P_UUID"
+
+# -----------------------------------------------------------------------------
+# Check: profile expiration
+# -----------------------------------------------------------------------------
+step "Provisioning profile validity"
+
+if [[ -z "$P_EXP_EPOCH" ]]; then
+    fail "profile has no ExpirationDate"
+else
+    NOW="$(date +%s)"
+    DAYS_LEFT=$(( (P_EXP_EPOCH - NOW) / 86400 ))
+    emit_output expires "$P_EXP_ISO"
+    emit_output days-remaining "$DAYS_LEFT"
+    if (( NOW > P_EXP_EPOCH )); then
+        fail "profile expired $(( -DAYS_LEFT )) day(s) ago, on $P_EXP_ISO — regenerate it in the Apple Developer portal"
+    else
+        pass "profile valid for $DAYS_LEFT more day(s), until $P_EXP_ISO"
+        (( DAYS_LEFT < 30 )) && warn "profile expires in under 30 days"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Check: bundle identifier
+# -----------------------------------------------------------------------------
+if [[ -n "$WANT_BUNDLE_ID" ]]; then
+    step "Bundle identifier"
+    if [[ -z "$P_BUNDLE_ID" ]]; then
+        fail "profile has no application-identifier, so '$WANT_BUNDLE_ID' cannot be checked"
+    elif [[ "$P_BUNDLE_ID" == "*" ]]; then
+        pass "'$WANT_BUNDLE_ID' is covered by the fully wildcard profile ($P_APPID)"
+        warn "a wildcard profile cannot carry push, app groups, iCloud or Sign in with Apple entitlements"
+    elif [[ "$P_BUNDLE_ID" == *"*" ]]; then
+        # Apple wildcards match by prefix: com.example.* covers com.example.app.
+        prefix="${P_BUNDLE_ID%\*}"
+        if [[ "$WANT_BUNDLE_ID" == "$prefix"* ]]; then
+            pass "'$WANT_BUNDLE_ID' matches the profile's wildcard '$P_BUNDLE_ID'"
+        else
+            fail "bundle ID mismatch: this profile only covers '$P_BUNDLE_ID', which does not match '$WANT_BUNDLE_ID'"
+        fi
+    elif [[ "$P_BUNDLE_ID" == "$WANT_BUNDLE_ID" ]]; then
+        pass "bundle ID matches exactly: $WANT_BUNDLE_ID"
+    else
+        fail "bundle ID mismatch: this profile is for '$P_BUNDLE_ID', the build wants '$WANT_BUNDLE_ID'"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Check: profile type and team
+# -----------------------------------------------------------------------------
+if [[ -n "$WANT_PROFILE_TYPE" ]]; then
+    step "Profile type"
+    want="$(printf '%s' "$WANT_PROFILE_TYPE" | tr '[:upper:]' '[:lower:]' | tr -d ' -_')"
+    case "$want" in
+        appstore|store|release)   want=appstore ;;
+        adhoc)                    want=adhoc ;;
+        development|dev|debug)    want=development ;;
+        enterprise|inhouse)       want=enterprise ;;
+        *) abort "unknown --profile-type '$WANT_PROFILE_TYPE' (expected development, adhoc, appstore or enterprise)" ;;
+    esac
+    if [[ "$P_TYPE" == "$want" ]]; then
+        pass "profile is a $P_TYPE profile, as expected"
+    else
+        fail "profile type mismatch: this is a '$P_TYPE' profile, the build expects '$want'"
+    fi
+fi
+
+if [[ -n "$WANT_TEAM_ID" ]]; then
+    step "Team identifier"
+    if [[ "$P_TEAM" == "$WANT_TEAM_ID" ]]; then
+        pass "team matches: $P_TEAM"
+    else
+        fail "team mismatch: profile belongs to team '$P_TEAM', the build expects '$WANT_TEAM_ID'"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Resolve the signing certificate
+# -----------------------------------------------------------------------------
+step "Signing certificate"
+
+CERT_SHA1_LIST=""
+CERT_CN=""
+CERT_TEAM=""
+CERT_SOURCE=""
+
+if [[ "$HAVE_CERT" == true ]]; then
+    if [[ -n "$CERT_PATH" ]]; then
+        read_input "$CERT_PATH" || abort "could not read certificate file: $CERT_PATH"
+        CERT_ORIGIN="$CERT_PATH"
+    else
+        read_input_content "$CERT_CONTENT" || abort "could not read the certificate from \$IOS_CERT_BASE64"
+        CERT_ORIGIN="\$IOS_CERT_BASE64"
+    fi
+    CERT_HELD="$INPUT_HELD"
+    case "$INPUT_FORMAT" in
+        pem) CERT_FORMAT=pem ;;
+        der) CERT_FORMAT=p12 ;;
+        *)   abort "unrecognised certificate format in $CERT_ORIGIN (expected PEM or PKCS#12, raw or base64)" ;;
+    esac
+    CERT_SOURCE="$CERT_ORIGIN ($CERT_FORMAT)"
+    info "source     $CERT_SOURCE"
+
+    # The password goes in on file descriptor 3 from a process substitution.
+    # That is a pipe: it never reaches disk (a bash here-string would spill into
+    # a temp file) and never appears in ps. openssl wants a terminated line, so
+    # the value is newline-terminated even when empty.
+    p12_extract() {  # p12_extract <openssl pkcs12 args...>
+        local out
+        out="$(emit "$CERT_HELD" | "$OPENSSL" pkcs12 "$@" -passin fd:3 2>/dev/null \
+                 3< <(printf '%s\n' "$CERT_PASSWORD"))"
+        if [[ -z "$out" && -n "$P12_LEGACY" ]]; then
+            # OpenSSL 3 refuses Apple's legacy PKCS#12 ciphers without this.
+            out="$(emit "$CERT_HELD" | "$OPENSSL" pkcs12 "$@" $P12_LEGACY -passin fd:3 2>/dev/null \
+                     3< <(printf '%s\n' "$CERT_PASSWORD"))"
+        fi
+        printf '%s' "$out"
+    }
+
+    leaf_cert_pem() {
+        case "$CERT_FORMAT" in
+            pem) emit "$CERT_HELD" | "$OPENSSL" x509 2>/dev/null ;;
+            p12) p12_extract -nokeys -clcerts | "$OPENSSL" x509 2>/dev/null ;;
+        esac
+    }
+
+    # Only the public half of the private key is ever materialised.
+    key_public_pem() {
+        case "$CERT_FORMAT" in
+            pem) emit "$CERT_HELD" | "$OPENSSL" pkey -pubout -passin fd:3 2>/dev/null \
+                     3< <(printf '%s\n' "$CERT_PASSWORD") ;;
+            p12) p12_extract -nocerts -nodes | "$OPENSSL" pkey -pubout 2>/dev/null ;;
+        esac
+    }
+
+    LEAF_PEM="$(leaf_cert_pem)"
+    if [[ -z "$LEAF_PEM" ]]; then
+        if [[ "$CERT_FORMAT" == p12 ]]; then
+            abort "could not read a certificate from $CERT_ORIGIN — if it is password protected, set \$IOS_CERT_PASSWORD (a wrong password and a corrupt file look identical here)"
+        fi
+        abort "could not read a certificate from $CERT_ORIGIN"
+    fi
+
+    CERT_SUBJECT="$(printf '%s' "$LEAF_PEM" | "$OPENSSL" x509 -noout -subject -nameopt multiline,utf8 2>/dev/null)"
+    CERT_CN="$(printf '%s' "$CERT_SUBJECT" | sed -n 's/^ *commonName *= *//p' | head -1)"
+    # Apple puts the team identifier in the OU of a signing certificate.
+    CERT_TEAM="$(printf '%s' "$CERT_SUBJECT" | sed -n 's/^ *organizationalUnitName *= *//p' | head -1)"
+    CERT_SHA1_LIST="$(printf '%s' "$LEAF_PEM" | "$OPENSSL" x509 -noout -fingerprint -sha1 2>/dev/null | cut -d= -f2 | normalise_sha1)"
+
+    info "identity   ${CERT_CN:-(no common name)}"
+    info "sha-1      $CERT_SHA1_LIST"
+    [[ -n "$CERT_TEAM" ]] && info "team       $CERT_TEAM"
+    emit_output cert-sha1 "$CERT_SHA1_LIST"
+    emit_output cert-name "$CERT_CN"
+
+    # An expired certificate cannot sign, whatever the profile says.
+    if ! printf '%s' "$LEAF_PEM" | "$OPENSSL" x509 -checkend 0 -noout >/dev/null 2>&1; then
+        CERT_END="$(printf '%s' "$LEAF_PEM" | "$OPENSSL" x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+        fail "the signing certificate itself expired on $CERT_END — request a new one in the Apple Developer portal"
+    else
+        pass "certificate is present and within its validity window"
+    fi
+
+    if [[ -n "$CERT_NAME" && "$CERT_CN" != "$CERT_NAME" ]]; then
+        fail "certificate name mismatch: the certificate is '$CERT_CN', the build expects '$CERT_NAME'"
+    fi
+
+    # ---------------------------------------------------------------------
+    step "Private key"
+    CERT_PUBKEY="$(printf '%s' "$LEAF_PEM" | "$OPENSSL" x509 -pubkey -noout 2>/dev/null)"
+    KEY_PUBKEY="$(key_public_pem)"
+    if [[ -z "$KEY_PUBKEY" ]]; then
+        fail "no private key in $CERT_ORIGIN — signing needs the certificate and its key; re-export the identity with the key included"
+    elif [[ "$CERT_PUBKEY" == "$KEY_PUBKEY" ]]; then
+        pass "private key is present and pairs with the certificate"
+    else
+        fail "the private key in $CERT_ORIGIN belongs to a different certificate than '$CERT_CN'"
+    fi
+else
+    # macOS only, read-only: no keychain is created, imported into or modified.
+    CERT_SOURCE="macOS keychains (read-only)"
+    info "source     $CERT_SOURCE"
+    info "identity   $CERT_NAME"
+
+    if ! security default-keychain >/dev/null 2>&1; then
+        warn "no default keychain is set; lookups fall back to the search list, but other signing tools will fail. Restore it with: security default-keychain -s ~/Library/Keychains/login.keychain-db"
+    fi
+
+    CERT_SHA1_LIST="$(security find-certificate -a -c "$CERT_NAME" -Z 2>/dev/null \
+        | grep '^SHA-1 hash:' | cut -d: -f2- | normalise_sha1)"
+    if [[ -z "$CERT_SHA1_LIST" ]]; then
+        fail "certificate '$CERT_NAME' is not in any keychain in the search list"
+    else
+        pass "found $(printf '%s\n' "$CERT_SHA1_LIST" | grep -c .) matching certificate(s) in the keychains"
+    fi
+
+    step "Private key"
+    # find-identity -v lists only identities that have a usable private key.
+    if security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$CERT_NAME\""; then
+        pass "a usable code signing identity (certificate + private key) exists"
+    else
+        fail "'$CERT_NAME' has no usable private key in the keychains, so it cannot sign"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Check: the profile authorises this certificate
+#
+# This is the one that usually surfaces as an opaque failure at export time, so
+# it explains the mismatch rather than just reporting it.
+# -----------------------------------------------------------------------------
+step "Certificate is authorised by the profile"
+
+if [[ -z "$CERT_SHA1_LIST" ]]; then
+    fail "no certificate fingerprint to compare (the certificate could not be read)"
+elif (( P_CERT_COUNT == 0 )); then
+    fail "the profile embeds no developer certificates, so it cannot authorise anything"
+else
+    MATCHED=""
+    while read -r sha; do
+        [[ -n "$sha" ]] || continue
+        if printf '%s\n' "$CERT_SHA1_LIST" | grep -qxF "$sha"; then MATCHED="$sha"; break; fi
+    done < <(printf '%s' "$P_CERT_SHA1S")
+
+    if [[ -n "$MATCHED" ]]; then
+        pass "the profile authorises this certificate ($MATCHED)"
+    else
+        fail "this certificate is not one of the $P_CERT_COUNT the profile authorises"
+
+        # Say what the profile does authorise. Names are resolved only here, on
+        # the failure path, so the passing case stays fast.
+        printf '\n   %sWhat the profile authorises:%s\n' "$BOLD" "$NC"
+        idx=0
+        PROFILE_TEAMS=""
+        while read -r sha; do
+            [[ -n "$sha" ]] || continue
+            der_cn=""
+            if true; then
+                der_cn="$(profile_plist \
+                    | "$PYTHON" -c '
+import sys, plistlib
+i = int(sys.argv[1])
+pl = plistlib.loads(sys.stdin.buffer.read())
+certs = pl.get("DeveloperCertificates") or []
+sys.stdout.buffer.write(bytes(certs[i]) if i < len(certs) else b"")
+' "$idx" 2>/dev/null \
+                    | "$OPENSSL" x509 -inform der -noout -subject -nameopt multiline,utf8 2>/dev/null)"
+            fi
+            cn="$(printf '%s' "$der_cn" | sed -n 's/^ *commonName *= *//p' | head -1)"
+            ou="$(printf '%s' "$der_cn" | sed -n 's/^ *organizationalUnitName *= *//p' | head -1)"
+            [[ -n "$ou" ]] && PROFILE_TEAMS+="$ou"$'\n'
+            printf '     %s  %s%s\n' "$sha" "${cn:-(unknown certificate)}" "${ou:+  [team $ou]}"
+            idx=$((idx + 1))
+        done < <(printf '%s' "$P_CERT_SHA1S")
+
+        printf '\n   %sWhat the build supplied:%s\n' "$BOLD" "$NC"
+        while read -r sha; do
+            [[ -n "$sha" ]] || continue
+            printf '     %s  %s%s\n' "$sha" "${CERT_CN:-(from keychain)}" "${CERT_TEAM:+  [team $CERT_TEAM]}"
+        done < <(printf '%s\n' "$CERT_SHA1_LIST")
+
+        # Name the likely cause instead of leaving it as an exercise. The teams
+        # on the embedded certificates discriminate better than the profile's
+        # own TeamIdentifier, which can disagree with what it actually embeds.
+        printf '\n'
+        PROFILE_TEAM_SET="$(printf '%s' "$PROFILE_TEAMS" | grep . | sort -u | paste -sd, - 2>/dev/null)"
+        if [[ -n "$CERT_TEAM" ]] && printf '%s' "$PROFILE_TEAMS" | grep -qxF "$CERT_TEAM"; then
+            info "Likely cause: same team, different certificate. The profile was generated before this certificate existed, or against one that has since been revoked. Regenerate the profile in the Apple Developer portal so it picks up the current certificate."
+        elif [[ -n "$CERT_TEAM" && -n "$PROFILE_TEAM_SET" ]]; then
+            info "Likely cause: different Apple Developer accounts. The profile authorises certificates from team $PROFILE_TEAM_SET, but this certificate belongs to team $CERT_TEAM. Check which secret the workflow is reading."
+        elif [[ -n "$CERT_TEAM" && -n "$P_TEAM" && "$CERT_TEAM" != "$P_TEAM" ]]; then
+            info "Likely cause: the certificate belongs to team $CERT_TEAM but the profile is for team $P_TEAM. These are different Apple Developer accounts."
+        else
+            info "Likely cause: the profile and the certificate come from different sources. Regenerate the profile against the certificate you are signing with."
+        fi
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Verdict
+# -----------------------------------------------------------------------------
+printf '\n'
+if (( FAILURES == 0 )); then
+    printf '%s=== PASS: this certificate can sign %s with this profile ===%s\n' \
+        "$GREEN" "${WANT_BUNDLE_ID:-${P_BUNDLE_ID:-the app}}" "$NC"
+    emit_output result pass
+else
+    printf '%s=== FAIL: %d check(s) failed — signing will not succeed ===%s\n' \
+        "$RED" "$FAILURES" "$NC"
+    emit_output result fail
+fi
+
+if [[ "$WRITE_SUMMARY" == true && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+        printf '## assert-ios-signing\n\n'
+        if (( FAILURES == 0 )); then
+            printf '**PASS** — `%s` can be signed with this profile.\n\n' "${WANT_BUNDLE_ID:-${P_BUNDLE_ID:-the app}}"
+        else
+            printf '**FAIL** — %d check(s) failed. Signing will not succeed.\n\n' "$FAILURES"
+        fi
+        printf '| Profile | |\n| --- | --- |\n'
+        printf '| Name | %s |\n' "${P_NAME:-—}"
+        printf '| Bundle ID | `%s` |\n' "${P_BUNDLE_ID:-—}"
+        printf '| Type | %s |\n' "${P_TYPE:-—}"
+        printf '| Team | %s |\n' "${P_TEAM:-—}"
+        printf '| Expires | %s |\n' "${P_EXP_ISO:-—}"
+        printf '| Certificate | %s |\n' "${CERT_CN:-${CERT_NAME:-—}}"
+        printf '\n| | Check |\n| --- | --- |\n%s\n' "$SUMMARY_ROWS"
+    } >> "$GITHUB_STEP_SUMMARY"
+fi
+
+(( FAILURES == 0 )) || exit 1
+exit 0

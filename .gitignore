@@ -1,0 +1,6 @@
+# Never commit real signing material.
+*.p12
+*.pem
+*.mobileprovision
+*.mobileprovision.b64
+fixtures/

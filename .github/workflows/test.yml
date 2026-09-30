@@ -1,0 +1,134 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The script has to behave identically on a cheap Linux runner and on macOS,
+  # since the whole point is to run the checks before the macOS job starts.
+  suite:
+    name: suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04, macos-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          openssl version
+          python3 -V
+          bash --version | head -1
+      - name: Run test suite
+        run: ./test/run-tests.sh
+
+  # Apple exports .p12 files with ciphers OpenSSL 3 will not touch without
+  # -legacy. This proves the fallback works rather than assuming it.
+  legacy-p12:
+    name: legacy PKCS#12 ciphers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fixtures and a Keychain-Access-style p12
+        run: |
+          ./test/make-fixtures.sh "$RUNNER_TEMP/fx" >/dev/null
+          openssl pkcs12 -export -legacy \
+            -inkey "$RUNNER_TEMP/fx/primary-key.pem" \
+            -in "$RUNNER_TEMP/fx/primary-cert.pem" \
+            -out "$RUNNER_TEMP/fx/legacy.p12" -passout pass:hunter2 \
+            -certpbe PBE-SHA1-RC2-40 -keypbe PBE-SHA1-3DES -macalg sha1
+      - name: Plain openssl should refuse it
+        run: |
+          if openssl pkcs12 -in "$RUNNER_TEMP/fx/legacy.p12" -passin pass:hunter2 -nokeys >/dev/null 2>&1; then
+            echo "note: this openssl reads legacy ciphers unaided; the fallback is untested here"
+          else
+            echo "confirmed: openssl $(openssl version | cut -d' ' -f2) needs -legacy for this file"
+          fi
+      - name: The action must read it anyway
+        env:
+          IOS_CERT_PASSWORD: hunter2
+        run: |
+          ./bin/assert-ios-signing \
+            --profile "$RUNNER_TEMP/fx/dev.mobileprovision" \
+            --cert "$RUNNER_TEMP/fx/legacy.p12" \
+            --cert-name "Apple Development: Test User (E394HWR6G8)"
+
+  # Exercise the composite action the way a consumer does, including passing
+  # credentials as base64 content rather than paths.
+  action:
+    name: action interface (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fixtures
+        id: fx
+        run: |
+          ./test/make-fixtures.sh "$RUNNER_TEMP/fx" >/dev/null
+          echo "profile=$(cat "$RUNNER_TEMP/fx/dev.mobileprovision.b64")" >> "$GITHUB_OUTPUT"
+          echo "cert=$(cat "$RUNNER_TEMP/fx/primary.p12.b64")" >> "$GITHUB_OUTPUT"
+
+      - name: Assert signing (base64 content, as a secret would arrive)
+        id: check
+        uses: ./
+        with:
+          profile: ${{ steps.fx.outputs.profile }}
+          certificate: ${{ steps.fx.outputs.cert }}
+          certificate-password: hunter2
+          bundle-id: com.example.myapp
+          profile-type: development
+          team-id: E394HWR6G8
+
+      - name: Outputs must be populated
+        run: |
+          set -e
+          test "${{ steps.check.outputs.result }}" = "pass"
+          test "${{ steps.check.outputs.bundle-id }}" = "com.example.myapp"
+          test "${{ steps.check.outputs.team-id }}" = "E394HWR6G8"
+          test "${{ steps.check.outputs.profile-type }}" = "development"
+          test -n "${{ steps.check.outputs.cert-sha1 }}"
+          test -n "${{ steps.check.outputs.expires }}"
+          echo "all outputs present"
+
+      - name: Assert signing (file paths)
+        uses: ./
+        with:
+          profile: ${{ runner.temp }}/fx/dev.mobileprovision
+          certificate: ${{ runner.temp }}/fx/primary.p12
+          certificate-password: hunter2
+          bundle-id: com.example.myapp
+
+      # A mismatch has to fail the step, and the failure has to say why.
+      - name: A mismatch must fail, with an explanation
+        id: mismatch
+        continue-on-error: true
+        uses: ./
+        with:
+          profile: ${{ runner.temp }}/fx/stale.mobileprovision
+          certificate: ${{ runner.temp }}/fx/primary.p12
+          certificate-password: hunter2
+          bundle-id: com.example.myapp
+          summary: 'false'
+      - name: Confirm it failed
+        run: |
+          if [ "${{ steps.mismatch.outcome }}" != "failure" ]; then
+            echo "expected the mismatch step to fail"; exit 1
+          fi
+          echo "mismatch correctly failed the step"
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          shellcheck -S warning bin/assert-ios-signing test/*.sh

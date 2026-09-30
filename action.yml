@@ -1,0 +1,123 @@
+name: 'Assert iOS Signing'
+description: 'Prove a provisioning profile and certificate can sign your bundle ID — in seconds, on Linux, before a macOS build tries and fails.'
+author: 'Matt Goldman'
+
+branding:
+  icon: 'shield'
+  color: 'gray-dark'
+
+inputs:
+  profile:
+    description: |
+      The provisioning profile. Either a path to a file in the workspace, or the
+      base64 content of one (what you would store in a secret).
+    required: true
+  certificate:
+    description: |
+      The signing certificate: a PKCS#12 (.p12) or a PEM holding the certificate
+      and its private key. A path, or base64 content.
+    required: false
+  certificate-password:
+    description: 'Password for the certificate. Pass the secret; it is never written to disk.'
+    required: false
+    default: ''
+  certificate-name:
+    description: |
+      Optional. Assert the certificate's common name, e.g.
+      "Apple Distribution: Example Pty Ltd (ABC123)". Usually better left unset:
+      the name changes when a certificate is renewed, and the checks that matter
+      do not depend on it.
+    required: false
+    default: ''
+  bundle-id:
+    description: 'The app bundle identifier the build will sign, e.g. com.example.app.'
+    required: false
+    default: ''
+  profile-type:
+    description: 'Assert the profile kind: development, adhoc, appstore or enterprise.'
+    required: false
+    default: ''
+  team-id:
+    description: 'Assert the Apple Developer team identifier.'
+    required: false
+    default: ''
+  summary:
+    description: 'Write a job summary table. Set to false to skip.'
+    required: false
+    default: 'true'
+
+outputs:
+  result:
+    description: 'pass or fail.'
+    value: ${{ steps.assert.outputs.result }}
+  bundle-id:
+    description: "The bundle ID the profile is for, wildcards included."
+    value: ${{ steps.assert.outputs.bundle-id }}
+  profile-name:
+    description: 'The profile name as it appears in the Apple Developer portal.'
+    value: ${{ steps.assert.outputs.profile-name }}
+  profile-type:
+    description: 'development, adhoc, appstore or enterprise.'
+    value: ${{ steps.assert.outputs.profile-type }}
+  profile-uuid:
+    description: "The profile UUID."
+    value: ${{ steps.assert.outputs.profile-uuid }}
+  team-id:
+    description: 'The Apple Developer team identifier.'
+    value: ${{ steps.assert.outputs.team-id }}
+  expires:
+    description: 'Profile expiry, as UTC.'
+    value: ${{ steps.assert.outputs.expires }}
+  days-remaining:
+    description: 'Whole days until the profile expires. Negative if it already has.'
+    value: ${{ steps.assert.outputs.days-remaining }}
+  cert-sha1:
+    description: 'SHA-1 fingerprint of the signing certificate.'
+    value: ${{ steps.assert.outputs.cert-sha1 }}
+  cert-name:
+    description: "The signing certificate's common name."
+    value: ${{ steps.assert.outputs.cert-name }}
+
+runs:
+  using: composite
+  steps:
+    - id: assert
+      shell: bash
+      env:
+        # Passed through the environment rather than the command line, so neither
+        # the certificate nor its password appears in the process table.
+        INPUT_PROFILE: ${{ inputs.profile }}
+        INPUT_CERTIFICATE: ${{ inputs.certificate }}
+        IOS_CERT_PASSWORD: ${{ inputs.certificate-password }}
+        INPUT_CERT_NAME: ${{ inputs.certificate-name }}
+        INPUT_BUNDLE_ID: ${{ inputs.bundle-id }}
+        INPUT_PROFILE_TYPE: ${{ inputs.profile-type }}
+        INPUT_TEAM_ID: ${{ inputs.team-id }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+      run: |
+        set -uo pipefail
+        args=()
+
+        # A value that names an existing file is treated as a path; anything else
+        # is treated as content and handed over in the environment.
+        if [[ -f "$INPUT_PROFILE" ]]; then
+          args+=(--profile "$INPUT_PROFILE")
+        else
+          export IOS_PROFILE_BASE64="$INPUT_PROFILE"
+        fi
+
+        if [[ -n "$INPUT_CERTIFICATE" ]]; then
+          if [[ -f "$INPUT_CERTIFICATE" ]]; then
+            args+=(--cert "$INPUT_CERTIFICATE")
+          else
+            export IOS_CERT_BASE64="$INPUT_CERTIFICATE"
+          fi
+        fi
+
+        [[ -n "$INPUT_CERT_NAME"    ]] && args+=(--cert-name    "$INPUT_CERT_NAME")
+        [[ -n "$INPUT_BUNDLE_ID"    ]] && args+=(--bundle-id    "$INPUT_BUNDLE_ID")
+        [[ -n "$INPUT_PROFILE_TYPE" ]] && args+=(--profile-type "$INPUT_PROFILE_TYPE")
+        [[ -n "$INPUT_TEAM_ID"      ]] && args+=(--team-id      "$INPUT_TEAM_ID")
+        [[ "$INPUT_SUMMARY" == "false" ]] && args+=(--no-summary)
+
+        "${GITHUB_ACTION_PATH}/bin/assert-ios-signing" "${args[@]}"
